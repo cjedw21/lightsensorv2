@@ -1,0 +1,125 @@
+import RPi.GPIO as GPIO
+import requests
+import pytz
+import csv
+import os
+from time import sleep
+from datetime import datetime
+
+# --- CONFIGURATION ---
+WEBHOOK_URL = "url"
+CSV_FILE = "csv file"
+TIMEZONE = pytz.timezone('America/Los_Angeles')
+
+# Timing Settings
+NORMAL_INTERVAL = 60
+FAST_INTERVAL = 10
+WINDOW_MINUTES = 30  # mins
+
+# GPIO Setup
+DO_PIN = 4
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(DO_PIN, GPIO.IN)
+
+def get_schedule_from_csv(target_date):
+    """
+    Finds the correct ON/OFF times from the CSV for a given date.
+    Looks for the most recent 'Date of Change' that is <= today.
+    """
+    best_row = None
+    best_date = None
+    
+    try:
+        with open(CSV_FILE, mode='r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Parse date from CSV (assumes M/D/YYYY)
+                date_str = row['Date of Change']
+                row_date = datetime.strptime(date_str, '%m/%d/%Y').date()
+                
+                if row_date <= target_date:
+                    if best_date is None or row_date > best_date:
+                        best_date = row_date
+                        best_row = row
+        
+        if best_row:
+            # 'Animal Holding' columns for main schedule
+            on_str = best_row['Animal Holding Lights ON (Audrey adjusts room timer)']
+            off_str = best_row['Animal Holding Lights OFF (Audrey adjusts room timer)']
+            return on_str, off_str
+            
+    except Exception as e:
+        print(f"Error reading CSV: {e}")
+    
+    return None, None
+
+def get_today_sun_times(on_str, off_str):
+    """Converts CSV time strings (7:45 AM) into datetime for today."""
+    now = datetime.now(TIMEZONE)
+    today_str = now.strftime('%Y-%m-%d')
+    
+    on_dt = datetime.strptime(f"{today_str} {on_str}", '%Y-%m-%d %I:%M %p')
+    off_dt = datetime.strptime(f"{today_str} {off_str}", '%Y-%m-%d %I:%M %p')
+    
+    return TIMEZONE.localize(on_dt), TIMEZONE.localize(off_dt)
+
+def get_current_interval(now_time, sunrise, sunset):
+    """Calculates if we should be in fast or slow mode."""
+    diff_sunrise = abs((now_time - sunrise).total_seconds()) / 60
+    diff_sunset = abs((now_time - sunset).total_seconds()) / 60
+    
+    if diff_sunrise <= WINDOW_MINUTES or diff_sunset <= WINDOW_MINUTES:
+        return FAST_INTERVAL
+    return NORMAL_INTERVAL
+
+# --- MAIN LOOP ---
+print(f"--- CSV-Based Sender Started ---")
+print(f"Using schedule from: {CSV_FILE}")
+
+try:
+    while True:
+        now = datetime.now(TIMEZONE)
+        
+        # 1. Get the schedule from the CSV
+        on_text, off_text = get_schedule_from_csv(now.date())
+        
+        if not on_text:
+            print("Warning: Could not find a valid schedule in CSV. Defaulting to 60s.")
+            current_sleep = NORMAL_INTERVAL
+        else:
+            # 2. Convert to actual times
+            sunrise_time, sunset_time = get_today_sun_times(on_text, off_text)
+            
+            # 3. Check Sensor & Logic
+            is_day = sunrise_time <= now <= sunset_time
+            light_on = (GPIO.input(DO_PIN) == GPIO.LOW)
+            
+            period = "Day" if is_day else "Night"
+            sensor_status = "On" if light_on else "Off"
+            mismatch = (is_day and not light_on) or (not is_day and light_on)
+
+            # 4. Build Message
+            timestamp = now.strftime('%Y-%m-%d %H:%M:%S')
+            content = f"{timestamp}, Period: {period}, Light Sensor: {sensor_status}"
+            if mismatch:
+                content = f"everyone ALERT: {content}"
+
+            # 5. Send to Discord
+            try:
+                requests.post(WEBHOOK_URL, json={"content": content}, timeout=10)
+                print(f"Sent: {content}")
+            except Exception as e:
+                print(f"Network Error: {e}")
+
+            # 6. Determine Sleep
+            current_sleep = get_current_interval(now, sunrise_time, sunset_time)
+            
+            mode_label = "TRANSITION" if current_sleep == FAST_INTERVAL else "NORMAL"
+            print(f"Mode: {mode_label} | Interval: {current_sleep}s")
+
+        sleep(current_sleep)
+
+except KeyboardInterrupt:
+    print("Stopping...")
+finally:
+    GPIO.cleanup()
