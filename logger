@@ -1,0 +1,88 @@
+import os
+import csv
+import discord
+from discord.ext import commands
+
+# --- CONFIGURATION ---
+TOKEN = "Token_Here"
+CHANNEL_ID = Channel_ID 
+
+# Add all User IDs
+TARGET_USER_IDS = [user1, user2]
+
+CSV_FILE = "collected_data.csv"
+
+intents = discord.Intents.default()
+intents.message_content = True 
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Ensure CSV exists
+if not os.path.exists(CSV_FILE):
+    with open(CSV_FILE, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Timestamp", "Period", "SensorStatus"])
+
+@bot.event
+async def on_ready():
+    print(f"Logger Bot is online as {bot.user}")
+    print(f"Alerts will be sent to {len(TARGET_USER_IDS)} users.")
+    
+    # Test DM on startup to the first user (you) to verify connection
+    try:
+        test_user = await bot.fetch_user(TARGET_USER_IDS[0])
+        await test_user.send("✅ **System Online:** Logger is now monitoring for alerts.")
+        print("Startup test DM sent.")
+    except Exception as e:
+        print(f"Startup DM failed (check privacy settings): {e}")
+
+@bot.command()
+async def getcsv(ctx):
+    if os.path.exists(CSV_FILE):
+        await ctx.send("Here is the log file:", file=discord.File(CSV_FILE))
+    else:
+        await ctx.send("CSV file not found.")
+
+@bot.event
+async def on_message(message):
+    await bot.process_commands(message)
+
+    # Ignore if it's the bot's own message
+    if message.author.id == bot.user.id:
+        return
+
+    # Process messages in the target channel
+    if message.channel.id == CHANNEL_ID:
+        content = message.content
+        
+        # Check for data markers
+        if "Period:" in content and "Light Sensor:" in content:
+            # Clean data for CSV
+            clean = content.replace("@everyone", "").replace("ALERT:", "")
+            clean = clean.replace("Period:", "").replace("Light Sensor:", "").strip()
+            
+            try:
+                parts = [p.strip() for p in clean.split(',')]
+                
+                if len(parts) == 3:
+                    # 1. Save to CSV
+                    with open(CSV_FILE, 'a', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(parts)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    print(f"CSV Updated: {parts}")
+
+                    # 2. Handle DM Alerts
+                    if "ALERT:" in content:
+                        for user_id in TARGET_USER_IDS:
+                            try:
+                                user = await bot.fetch_user(user_id)
+                                await user.send(f"⚠️ **SENSOR ALERT** ⚠️\n{content.replace('@everyone', '')}")
+                                print(f"Alert DM sent to {user_id}")
+                            except Exception as dm_err:
+                                print(f"Could not DM {user_id}: {dm_err}")
+                
+            except Exception as e:
+                print(f"Error processing row: {e}")
+
+bot.run(TOKEN)
